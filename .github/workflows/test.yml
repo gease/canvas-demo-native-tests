@@ -1,0 +1,182 @@
+name: Test canvas-demo builds
+
+# Tests a canvas-demo build from canvas-storybook-ai's GitLab CI on the systems
+# GitLab cannot run: macOS (Apple silicon and Intel) and Windows. The build's
+# macOS and Windows executables are packed on Linux there, so this is the first
+# time they run.
+#
+# - conformance: drupack's conformance suite, at the engine tag the build used,
+#   on each executable (what drupack's own release runs on these runners).
+# - install: the drupal-demo-install skill end to end, from the skill's branch,
+#   with the build under test, then its status checks, a Storybook restart and
+#   a stop. Ubuntu runs too, as the reference.
+#
+# Nothing here is pushed or published anywhere; failed jobs upload their logs.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_url:
+        description: The build's artifact folder (SITE_BUILD_URL), holding the executables and checksums.txt.
+        type: string
+      skill_ref:
+        description: The canvas-storybook-ai branch or tag whose drupal-demo-install skill is tested.
+        type: string
+      drupack_ref:
+        description: The drupack engine tag the build was packed with (its conformance suite).
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  BUILD_URL: ${{ inputs.build_url || 'https://gitlab.com/freelygive/canvas-storybook-ai/-/jobs/17297188984/artifacts/raw/.drupack/dist' }}
+  SKILL_REPO: https://gitlab.com/freelygive/canvas-storybook-ai.git
+  SKILL_REF: ${{ inputs.skill_ref || 'feat/drupal-demo-install' }}
+  DRUPACK_REF: ${{ inputs.drupack_ref || '1.0.0-beta1' }}
+
+jobs:
+  conformance:
+    name: conformance ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-arm64, runner: macos-15, file: canvas-demo-macos-arm64 }
+          - { target: macos-amd64, runner: macos-15-intel, file: canvas-demo-macos-amd64 }
+          - { target: windows-amd64, runner: windows-2025, file: canvas-demo-windows-amd64.exe }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: tresbientech/drupack
+          ref: ${{ env.DRUPACK_REF }}
+          path: drupack-engine
+          persist-credentials: false
+
+      - name: Download the executable
+        env:
+          FILE: ${{ matrix.file }}
+        run: |
+          mkdir dist
+          curl -fsSL --retry 3 -o dist/checksums.txt "$BUILD_URL/checksums.txt"
+          curl -fsSL --retry 3 -o dist/site.json "$BUILD_URL/site.json"
+          curl -fsSL --retry 3 -o "dist/$FILE" "$BUILD_URL/$FILE"
+          expected=$(awk -v f="$FILE" '$2 == f {print $1}' dist/checksums.txt)
+          if command -v sha256sum >/dev/null; then actual=$(sha256sum "dist/$FILE" | cut -d ' ' -f 1); else actual=$(shasum -a 256 "dist/$FILE" | cut -d ' ' -f 1); fi
+          echo "$FILE: SHA-256 $actual, checksums.txt lists $expected"
+          [ -n "$expected" ] && [ "$actual" = "$expected" ]
+          chmod +x "dist/$FILE"
+          "dist/$FILE" --version
+
+      # What drupack's release checks: a downloaded, unsigned macOS file starts
+      # once the quarantine flag a browser sets is removed. curl sets none.
+      - name: Check the unsigned launch steps
+        if: runner.os == 'macOS'
+        env:
+          FILE: ${{ matrix.file }}
+        run: |
+          mkdir -p test-results
+          cp "dist/$FILE" test-results/quarantined
+          xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" test-results/quarantined
+          xattr -d com.apple.quarantine test-results/quarantined
+          test-results/quarantined --help > /dev/null
+
+      - name: Run the conformance suite
+        env:
+          FILE: ${{ matrix.file }}
+        run: |
+          python=python3
+          if [ "$RUNNER_OS" = Windows ]; then python=python; fi
+          "$python" drupack-engine/tests/conformance "dist/$FILE" test-results/conformance
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-${{ matrix.target }}
+          path: test-results
+          if-no-files-found: ignore
+
+  install:
+    name: install ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
+    defaults:
+      run:
+        # On Windows, Git Bash: the shell the skill's scripts run in there.
+        shell: bash
+    steps:
+      - name: Get the skill
+        run: |
+          git clone -q --depth 1 --branch "$SKILL_REF" "$SKILL_REPO" skill-repo
+          git -C skill-repo log -1 --format='Skill at %h %s'
+          echo "SKILL=$PWD/skill-repo/skills/drupal-demo-install" >> "$GITHUB_ENV"
+          # The install folder in Git Bash's form on Windows (/d/a/_temp/demo).
+          dir="$RUNNER_TEMP/demo"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -u "$dir")"; fi
+          echo "DEMO=$dir" >> "$GITHUB_ENV"
+
+      - name: Show the plan
+        run: bash "$SKILL/scripts/install.sh" --dir "$DEMO" --plan
+
+      - name: Install
+        env:
+          SITE_BUILD_URL: ${{ env.BUILD_URL }}
+        run: bash "$SKILL/scripts/install.sh" --dir "$DEMO"
+
+      # A step of its own: the site and Storybook must outlive the command that
+      # started them, as they must outlive a Claude Code shell command.
+      - name: Check the install from a new shell
+        run: bash "$SKILL/scripts/check.sh" --dir "$DEMO"
+
+      # The SKILL.md rule for Claude Code on Windows when its shell is
+      # PowerShell: find Git's bash.exe from git and run the scripts with it.
+      - name: Check the install from PowerShell, through Git's bash.exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $gitBash = Join-Path (Split-Path (Split-Path (Split-Path (git --exec-path)))) 'bin\bash.exe'
+          Write-Output "Git's bash: $gitBash"
+          & $gitBash "$env:SKILL/scripts/check.sh" --dir ($env:RUNNER_TEMP + '\demo')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Restart Storybook with the workspace's command
+        working-directory: ${{ runner.temp }}/demo/migration
+        run: |
+          bash ../.drupal-demo/bin/storybook.sh stop
+          if bash ../.drupal-demo/bin/storybook.sh status; then echo "Storybook still runs after stop." >&2; exit 1; fi
+          bash ../.drupal-demo/bin/storybook.sh start
+          bash ../.drupal-demo/bin/storybook.sh status
+
+      - name: Run the hand-over report
+        run: bash "$SKILL/scripts/report.sh" --dir "$DEMO" | sed 's#/user/reset/[^ ]*#/user/reset/(one-time link)#'
+
+      - name: Stop the site and Storybook
+        run: |
+          bash "$SKILL/scripts/stop.sh" --dir "$DEMO"
+          sleep 5
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || true; }
+          [ "$(code http://localhost:7225/)" = 000 ] || { echo "The site still answers after stop." >&2; exit 1; }
+          [ "$(code http://127.0.0.1:6007/index.json)" = 000 ] || { echo "Storybook still answers after stop." >&2; exit 1; }
+          echo "Both stopped."
+
+      - name: Upload the install logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: install-logs-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/demo/.drupal-demo/logs
+            ${{ runner.temp }}/demo/storybook/storybook*.log
+            ${{ runner.temp }}/demo/data/logs
+          if-no-files-found: ignore
