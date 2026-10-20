@@ -103,15 +103,13 @@ jobs:
           path: test-results
           if-no-files-found: ignore
 
-  # Storybook of the component project on Windows (rounds 1-4): two bugs.
-  # vite-tsconfig-paths 6.0.5 runs it out of memory (removing it is the only
-  # fix), and without it @/components/<name> does not resolve, because
-  # @freelygive/canvas-utils 0.7.0 compares Vite's forward-slash module paths
-  # with its backslash components folder. Round 5 applies both fixes (the
-  # canvas-utils one as a patch of its dist file) and renders every story in
-  # Chromium on Windows and Linux.
+  # Storybook of the component project, as committed on the skill's branch,
+  # in a real browser: every story must render, not Storybook's error screen.
+  # Windows needed two fixes (found in the diagnostic rounds): no
+  # vite-tsconfig-paths in .storybook/main.ts, and a canvas-utils path patch
+  # that patch-package applies on install.
   storybook-browser:
-    name: storybook browser both-fixes ${{ matrix.runner }}
+    name: storybook browser ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
@@ -135,59 +133,9 @@ jobs:
         working-directory: project
         run: |
           npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
+          grep -A3 'Applying patches' ../npm-ci.log || { echo "patch-package did not run" >&2; exit 1; }
           deps=; [ "$RUNNER_OS" = Linux ] && deps=--with-deps
           npx playwright install $deps chromium > ../playwright.log 2>&1 || { tail -n 40 ../playwright.log; exit 1; }
-
-      - name: Remove vite-tsconfig-paths from the Storybook config
-        working-directory: project
-        run: |
-          py=python3; python3 -c 1 2>/dev/null || py=python
-          "$py" - <<'PY'
-          path = ".storybook/main.ts"
-          s = open(path).read()
-          plugin = "      tsconfigPaths({\n        root: path.resolve(__dirname, '..'),\n      }),\n"
-          assert plugin in s, "the tsconfigPaths call is not in main.ts"
-          s = s.replace(plugin, "").replace("import tsconfigPaths from 'vite-tsconfig-paths';\n", "")
-          open(path, "w").write(s)
-          PY
-          git diff .storybook/main.ts
-
-      # The fix proposed for canvas-utils' src/vite-storybook.ts: compare module
-      # paths with the components folder in forward-slash form as well. On
-      # Linux both forms are the same, so nothing changes there.
-      - name: Patch canvas-utils to compare paths with forward slashes
-        working-directory: project
-        run: |
-          py=python3; python3 -c 1 2>/dev/null || py=python
-          "$py" - <<'PY'
-          path = "node_modules/@freelygive/canvas-utils/dist/vite-storybook.js"
-          s = open(path, encoding="utf-8").read()
-          edits = [
-              ('  const dir = resolveComponentsDir(opts.componentsDir);\n',
-               '  const dir = resolveComponentsDir(opts.componentsDir);\n  const posixDir = dir.split(path3.sep).join("/");\n'),
-              # Storybook's own tsconfig paths can hand over the alias rewritten to
-              # a mixed path (a backslash folder, a forward-slash rest), with
-              # either drive-letter case: compare the normalised forms.
-              ('      } else if (source.startsWith(dir + path3.sep)) {\n        name = source.slice(dir.length + 1);\n      }',
-               '      } else if (source.startsWith(dir + path3.sep)) {\n        name = source.slice(dir.length + 1);\n'
-               '      } else if (source.replace(/\\\\/g, "/").toLowerCase().startsWith(posixDir.toLowerCase() + "/")) {\n'
-               '        name = source.replace(/\\\\/g, "/").slice(posixDir.length + 1);\n      }\n'
-               '      if (!name && /components/.test(source) && !/node_modules/.test(source)) console.warn("[canvas-utils debug] not resolved:", JSON.stringify(source), "components folder:", JSON.stringify(dir));'),
-              ('      return entryMap.get(name) ?? null;',
-               '      const entry = entryMap.get(name);\n      return entry ? entry.split(path3.sep).join("/") : null;'),
-              ('      if (id.startsWith(dir) && (id.endsWith(".component.yml")',
-               '      if ((id.startsWith(dir) || id.startsWith(posixDir)) && (id.endsWith(".component.yml")'),
-              ('  const dir = resolveComponentsDir(componentsDir);\n  return {\n    name: "storybook-component-css",',
-               '  const dir = resolveComponentsDir(componentsDir);\n  const posixDir = dir.split(path3.sep).join("/");\n  return {\n    name: "storybook-component-css",'),
-              ('      if (!id.startsWith(dir)) return;',
-               '      if (!id.startsWith(dir) && !id.startsWith(posixDir)) return;'),
-          ]
-          for old, new in edits:
-              assert s.count(old) == 1, f"not found once in {path}: {old!r}"
-              s = s.replace(old, new)
-          open(path, "w", encoding="utf-8").write(s)
-          print(f"{len(edits)} edits applied to {path}")
-          PY
 
       - name: Render every story in Chromium
         working-directory: project
@@ -263,10 +211,10 @@ jobs:
           fi
           echo "$out"
           echo "--- end of storybook.log"; tail -n 30 ../storybook.log
-          annotate notice "RESULT both-fixes $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
+          annotate notice "RESULT $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
           debug=$({ grep -a 'canvas-utils debug' ../storybook.log || true; } | sort -u | head -20 | cut -c1-400)
           [ -z "$debug" ] || annotate notice "canvas-utils debug $RUNNER_OS" "$debug"
-          annotate notice "storybook.log both-fixes $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
+          annotate notice "storybook.log $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
           exit $status
 
