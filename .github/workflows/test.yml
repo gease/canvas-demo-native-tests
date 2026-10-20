@@ -133,7 +133,9 @@ jobs:
         working-directory: project
         run: |
           npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
-          grep -A3 'Applying patches' ../npm-ci.log || { echo "patch-package did not run" >&2; exit 1; }
+          # npm hides install scripts' output, so check the patched file itself.
+          grep -q 'function relativeToDir' node_modules/@freelygive/canvas-utils/dist/vite-storybook.js \
+            && echo "canvas-utils patch applied" || { echo "patch-package did not patch canvas-utils" >&2; exit 1; }
           deps=; [ "$RUNNER_OS" = Linux ] && deps=--with-deps
           npx playwright install $deps chromium > ../playwright.log 2>&1 || { tail -n 40 ../playwright.log; exit 1; }
 
@@ -216,6 +218,79 @@ jobs:
           [ -z "$debug" ] || annotate notice "canvas-utils debug $RUNNER_OS" "$debug"
           annotate notice "storybook.log $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
+          exit $status
+
+  # The component project's Vitest suite (npm test: every story run as a
+  # test in Chromium, through @storybook/addon-vitest) on Windows and Linux.
+  # vitest.config.ts still registers vite-tsconfig-paths, which ran
+  # Storybook's dev server out of memory on Windows; this checks whether it
+  # does the same here. Results also go out as annotations.
+  vitest:
+    name: vitest ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, ubuntu-24.04]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+
+      - name: Get the component project
+        run: |
+          git clone -q --depth 1 --branch "$SKILL_REF" "$SKILL_REPO" project
+          git -C project log -1 --format='Project at %h %s'
+
+      - name: Install the npm packages and Chromium
+        working-directory: project
+        run: |
+          npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
+          grep -q 'function relativeToDir' node_modules/@freelygive/canvas-utils/dist/vite-storybook.js \
+            && echo "canvas-utils patch applied" || { echo "patch-package did not patch canvas-utils" >&2; exit 1; }
+          deps=; [ "$RUNNER_OS" = Linux ] && deps=--with-deps
+          npx playwright install $deps chromium > ../playwright.log 2>&1 || { tail -n 40 ../playwright.log; exit 1; }
+
+      - name: Run the Vitest suite
+        working-directory: project
+        run: |
+          annotate() {
+            local text="$3"; text="${text//'%'/'%25'}"; text="${text//$'\r'/}"; text="${text//$'\n'/'%0A'}"
+            echo "::$1 title=$2::$text"
+          }
+          memory() {
+            if [ "$RUNNER_OS" = Windows ]; then
+              powershell.exe -NoProfile -Command '[int]((Get-Process node -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum / 1MB)' | tr -d '\r'
+            else
+              ps -eo rss=,args= | awk '$2 ~ /(^|\/)node$/ {s += $1} END {print int(s / 1024)}'
+            fi
+          } 2>/dev/null
+          start=$SECONDS
+          npx vitest run > ../vitest.log 2>&1 &
+          pid=$!
+          peak=0; timeline=
+          while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - start)) -lt 1800 ]; do
+            m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
+            timeline="$timeline$((SECONDS - start))s ${m:-0}MB; "
+            sleep 15
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "Vitest still running after 30 minutes; stopping it."
+            if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else kill "$pid" || true; fi
+          fi
+          status=0; wait "$pid" || status=$?
+          summary=$({ grep -a -E 'Test Files|Tests  |Duration|heap out of memory|Error:' ../vitest.log || true; } | sed 's/\x1b\[[0-9;]*m//g' | head -20)
+          failed=$({ grep -a -E '^ *(FAIL|×|✗) ' ../vitest.log || true; } | sed 's/\x1b\[[0-9;]*m//g' | sort -u | head -20)
+          result="RESULT vitest on $RUNNER_OS: exit $status after $((SECONDS - start))s, peak node memory ${peak} MB"
+          echo "$result"; echo "$summary"; echo "--- end of vitest.log"; tail -n 40 ../vitest.log
+          annotate notice "RESULT vitest $RUNNER_OS" "$(printf '%s\n%s' "$result" "$summary")"
+          annotate notice "memory vitest $RUNNER_OS" "$timeline"
+          [ -z "$failed" ] || annotate notice "failed tests $RUNNER_OS" "$failed"
+          annotate notice "vitest.log $RUNNER_OS" "$(tail -n 30 ../vitest.log | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-300)"
           exit $status
 
   install:
