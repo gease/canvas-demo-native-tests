@@ -182,13 +182,29 @@ jobs:
                   : /sb-show-main/.test(c) ? 'main'
                   : /sb-show-nopreview/.test(c) ? 'nopreview' : 'preparing';
               });
+              // Computed styles of the rendered elements, without fonts (which
+              // differ between systems): the same CSS gives the same fingerprint.
+              const fingerprint = state !== 'main' ? '' : await page.evaluate(() => {
+                const props = ['display', 'position', 'padding', 'margin', 'gap', 'color',
+                  'background-color', 'border-width', 'border-radius', 'font-size', 'font-weight',
+                  'flex-direction', 'grid-template-columns', 'text-align', 'max-width'];
+                const root = document.querySelector('#storybook-root') || document.body;
+                const rows = [...root.querySelectorAll('*')].slice(0, 300).map((el) => {
+                  const cs = getComputedStyle(el);
+                  return el.tagName + ':' + props.map((p) => cs.getPropertyValue(p)).join(',');
+                });
+                let h = 0;
+                for (const ch of rows.join('|')) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+                return rows.length + ':' + h.toString(16);
+              });
               const message = state === 'main' ? '' : await page.evaluate(() =>
                 [document.querySelector('#error-message'), document.querySelector('#error-stack')]
                   .map((n) => (n ? n.textContent.trim() : '')).join(' | ').slice(0, 400));
-              return { state, message };
+              return { state, message, fingerprint };
             };
             let rendered = 0;
             const failed = [];
+            const fingerprints = [];
             for (const story of stories) {
               let result;
               // The first visits can meet Vite's dependency optimisation reload.
@@ -196,9 +212,19 @@ jobs:
                 try { result = await render(story); } catch (e) { result = { state: 'timeout', message: String(e.message).split('\n')[0] }; }
                 if (result.state === 'main') break;
               }
-              if (result.state === 'main') rendered++;
+              if (result.state === 'main') { rendered++; fingerprints.push(`${story.id} ${result.fingerprint}`); }
               else failed.push(`${story.id} (${story.importPath}): ${result.state} ${result.message} ${errors.slice(0, 2).join(' / ')}`.slice(0, 600));
             }
+            // The global stylesheet (Tailwind, from .storybook/preview.tsx's import).
+            await page.goto(`${base}/iframe.html?id=${stories[0].id}&viewMode=story`, { waitUntil: 'load' });
+            await page.waitForTimeout(2000);
+            const sheets = await page.evaluate(() => [...document.styleSheets].map((sh) => {
+              const node = sh.ownerNode;
+              const id = (node && node.getAttribute && node.getAttribute('data-vite-dev-id')) || (sh.href || 'inline');
+              let rules = -1; try { rules = sh.cssRules.length; } catch {}
+              return `${id.replace(/^.*\/(src|node_modules)\//, '$1/')} ${rules} rules`;
+            }));
+            fs.writeFileSync('../css.txt', ['stylesheets:', ...sheets, 'fingerprints:', ...fingerprints].join('\n') + '\n');
             console.log(`${rendered}/${stories.length} stories rendered`);
             for (const line of failed.slice(0, 20)) console.log(`  FAILED ${line}`);
             await browser.close();
@@ -216,6 +242,7 @@ jobs:
           annotate notice "RESULT $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
           debug=$({ grep -a 'canvas-utils debug' ../storybook.log || true; } | sort -u | head -20 | cut -c1-400)
           [ -z "$debug" ] || annotate notice "canvas-utils debug $RUNNER_OS" "$debug"
+          [ -f ../css.txt ] && annotate notice "css $RUNNER_OS" "$(cat ../css.txt)"
           annotate notice "storybook.log $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
           exit $status
