@@ -103,11 +103,12 @@ jobs:
           path: test-results
           if-no-files-found: ignore
 
-  # Diagnostic: on Windows, Storybook of the component project ran out of
-  # memory (about 4 GB) while building its story index, where Linux and macOS
-  # take seconds. Each variant runs the project on plain Node (no drupack, no
-  # skill), starts Storybook, asks for index.json and reports the time and the
-  # memory Node used, to tell which part of the setup causes it.
+  # Diagnostic: on Windows, Storybook of the component project runs out of
+  # memory right after it is ready (round 1: plain Node, as-is, about 40 MB/s,
+  # index.json never answers; not the experimental features, the canvas-utils
+  # plugins or the MCP/Vitest addons). Round 2 runs Storybook through node with
+  # a crash report (the JavaScript stack when memory runs out) and splits the
+  # remaining suspects. Each variant logs Node's memory every 10 seconds.
   windows-storybook:
     name: windows storybook ${{ matrix.variant }}
     runs-on: windows-2025
@@ -115,12 +116,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant:
-          - as-is
-          - no-experimental-features
-          - no-canvas-utils-plugins
-          - no-mcp-vitest-addons
-          - more-memory
+        include:
+          # The unchanged project, asked for index.json once ready.
+          - { variant: as-is, mode: dev }
+          # Never asked for index.json: does memory grow without a request?
+          - { variant: no-request, mode: idle }
+          # The index alone, without the dev server (storybook index).
+          - { variant: index-only, mode: index }
+          # Without vite-tsconfig-paths.
+          - { variant: no-tsconfig-paths, mode: dev }
+          # Without the .tests indexer and its glob: stories files only.
+          - { variant: no-tests-indexer, mode: dev }
     defaults:
       run:
         shell: bash
@@ -144,7 +150,7 @@ jobs:
           VARIANT: ${{ matrix.variant }}
         run: |
           python - <<'PY'
-          import os, re
+          import os
           variant = os.environ["VARIANT"]
           path = ".storybook/main.ts"
           s = open(path).read()
@@ -152,46 +158,88 @@ jobs:
               global s
               assert old in s, f"{old!r} is not in {path}"
               s = s.replace(old, new)
-          if variant == "no-experimental-features":
-              sub("experimentalComponentsManifest: true", "experimentalComponentsManifest: false")
-              sub("experimentalCodeExamples: true", "experimentalCodeExamples: false")
-          elif variant == "no-canvas-utils-plugins":
-              sub("componentNameResolver(),", "")
-              sub("plugins: [componentCssPlugin()]", "plugins: []")
-          elif variant == "no-mcp-vitest-addons":
-              s, n = re.subn(r"addons: \[.*?\n  \],", "addons: ['@storybook/addon-docs'],", s, flags=re.S)
-              assert n == 1, "no addons array found"
+          if variant == "no-tsconfig-paths":
+              sub("""      tsconfigPaths({
+                  root: path.resolve(__dirname, '..'),
+                }),
+          """.replace("\n          ", "\n"), "")
+          elif variant == "no-tests-indexer":
+              sub("    '../src/components/**/*.@(stories|tests).@(js|jsx|mjs|ts|tsx)',",
+                  "    '../src/components/**/*.stories.@(js|jsx|mjs|ts|tsx)',")
+              sub("  experimental_indexers: testsIndexer,\n", "")
           open(path, "w").write(s)
           PY
-          if [ "$VARIANT" = more-memory ]; then echo "NODE_OPTIONS=--max-old-space-size=12288" >> "$GITHUB_ENV"; fi
-          git diff --stat; git diff .storybook/main.ts | head -40
+          git diff .storybook/main.ts
 
-      - name: Start Storybook and fetch its index
+      - name: Run Storybook and watch its memory
         working-directory: project
+        env:
+          MODE: ${{ matrix.mode }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          npx storybook dev -p 6007 --host 127.0.0.1 --no-open --ci > ../storybook.log 2>&1 &
+          mkdir -p ../reports
+          # Through node itself, so the flags reach the process that runs out of
+          # memory: storybook dev and index run inside the dispatcher's process.
+          cli=node_modules/storybook/dist/bin/dispatcher.js
+          flags=(--report-on-fatalerror --report-directory=../reports)
+          node -e 'console.log("Heap limit", Math.round(require("v8").getHeapStatistics().heap_size_limit / 2**20), "MB")'
+          if [ "$MODE" = index ]; then
+            node "${flags[@]}" "$cli" index -o ../index.json > ../storybook.log 2>&1 &
+          else
+            node "${flags[@]}" "$cli" dev -p 6007 --host 127.0.0.1 --no-open --ci > ../storybook.log 2>&1 &
+          fi
+          pid=$!
           memory() { powershell.exe -NoProfile -Command '[int]((Get-Process node -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum / 1MB)' | tr -d '\r'; }
-          start=$SECONDS; peak=0; ready=; code=000
-          while [ $((SECONDS - start)) -lt 900 ]; do
+          start=$SECONDS; peak=0; ready=; code=000; limit=600; [ "$MODE" = idle ] && limit=240
+          while [ $((SECONDS - start)) -lt $limit ]; do
             if [ -z "$ready" ] && grep -q 'Storybook ready' ../storybook.log 2>/dev/null; then
               ready=$((SECONDS - start)); echo "Storybook ready after ${ready}s"
             fi
-            # Ask anyway after two minutes, in case the ready banner looks different.
-            if [ -n "$ready" ] || [ $((SECONDS - start)) -gt 120 ]; then
+            if [ "$MODE" = dev ] && { [ -n "$ready" ] || [ $((SECONDS - start)) -gt 120 ]; }; then
               code=$(curl -s -o ../index.json -w '%{http_code}' --max-time 20 http://127.0.0.1:6007/index.json || true)
               [ "$code" = 200 ] && break
             fi
+            if [ "$MODE" = index ] && ! kill -0 "$pid" 2>/dev/null; then echo "storybook index exited"; break; fi
             m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
             echo "$((SECONDS - start))s: node uses ${m:-0} MB, index.json answers $code"
             grep -q 'heap out of memory' ../storybook.log && { echo "Storybook ran out of memory."; break; }
             sleep 10
           done
-          m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
+          # Idle: only now ask for the index, once, to see that the server answers.
+          if [ "$MODE" = idle ]; then
+            code=$(curl -s -o ../index.json -w '%{http_code}' --max-time 60 http://127.0.0.1:6007/index.json || true)
+            echo "After $((SECONDS - start))s idle, index.json answers $code"
+          fi
+          [ "$MODE" = index ] && [ -s ../index.json ] && code=200
+          sleep 5
           entries=$(python -c "import json; print(len(json.load(open('../index.json'))['entries']))" 2>/dev/null || echo "-")
-          echo "RESULT ${{ matrix.variant }}: index.json $code after $((SECONDS - start))s, $entries entries, peak node memory ${peak} MB"
-          echo "--- end of storybook.log"; tail -n 40 ../storybook.log
+          echo "RESULT $VARIANT: index.json $code after $((SECONDS - start))s, $entries entries, peak node memory ${peak} MB"
+          echo "--- end of storybook.log"; tail -n 30 ../storybook.log
+          for report in ../reports/*.json; do
+            [ -f "$report" ] || continue
+            echo "--- JavaScript stack when memory ran out ($report)"
+            python - "$report" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1], encoding="utf-8"))
+          js = r.get("javascriptStack", {})
+          print(js.get("message", ""))
+          for line in js.get("stack", [])[:60]:
+              print(line)
+          heap = r.get("javascriptHeap", {})
+          for name, space in heap.get("heapSpaces", {}).items():
+              print(f"{name}: {space.get('used', 0) // 2**20} MB used")
+          PY
+          done
           taskkill //F //IM node.exe > /dev/null 2>&1 || true
           [ "$code" = 200 ]
+
+      - name: Upload the crash reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storybook-reports-${{ matrix.variant }}
+          path: reports
+          if-no-files-found: ignore
 
   install:
     name: install ${{ matrix.runner }}
