@@ -165,8 +165,14 @@ jobs:
           edits = [
               ('  const dir = resolveComponentsDir(opts.componentsDir);\n',
                '  const dir = resolveComponentsDir(opts.componentsDir);\n  const posixDir = dir.split(path3.sep).join("/");\n'),
-              ('      } else if (source.startsWith(dir + path3.sep)) {',
-               '      } else if (source.startsWith(dir + path3.sep) || source.startsWith(posixDir + "/")) {'),
+              # Storybook's own tsconfig paths can hand over the alias rewritten to
+              # a mixed path (a backslash folder, a forward-slash rest), with
+              # either drive-letter case: compare the normalised forms.
+              ('      } else if (source.startsWith(dir + path3.sep)) {\n        name = source.slice(dir.length + 1);\n      }',
+               '      } else if (source.startsWith(dir + path3.sep)) {\n        name = source.slice(dir.length + 1);\n'
+               '      } else if (source.replace(/\\\\/g, "/").toLowerCase().startsWith(posixDir.toLowerCase() + "/")) {\n'
+               '        name = source.replace(/\\\\/g, "/").slice(posixDir.length + 1);\n      }\n'
+               '      if (!name && /components/.test(source) && !/node_modules/.test(source)) console.warn("[canvas-utils debug] not resolved:", JSON.stringify(source), "components folder:", JSON.stringify(dir));'),
               ('      return entryMap.get(name) ?? null;',
                '      const entry = entryMap.get(name);\n      return entry ? entry.split(path3.sep).join("/") : null;'),
               ('      if (id.startsWith(dir) && (id.endsWith(".component.yml")',
@@ -258,6 +264,8 @@ jobs:
           echo "$out"
           echo "--- end of storybook.log"; tail -n 30 ../storybook.log
           annotate notice "RESULT both-fixes $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
+          debug=$(grep -a 'canvas-utils debug' ../storybook.log | sort -u | head -20 | cut -c1-400)
+          [ -z "$debug" ] || annotate notice "canvas-utils debug $RUNNER_OS" "$debug"
           annotate notice "storybook.log both-fixes $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
           exit $status
