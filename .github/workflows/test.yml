@@ -170,6 +170,22 @@ jobs:
           [ "$(code http://127.0.0.1:6007/index.json)" = 000 ] || { echo "Storybook still answers after stop." >&2; exit 1; }
           echo "Both stopped."
 
+      # What npm reads in the component project, and Storybook's own logs, in
+      # the job output: the uploaded logs need a GitHub login to read.
+      - name: Show Storybook diagnostics
+        if: failure()
+        working-directory: ${{ runner.temp }}/demo/storybook
+        run: |
+          site=../canvas-demo; [ "$RUNNER_OS" = Windows ] && site=../canvas-demo.exe
+          echo "--- .npmrc"; cat .npmrc 2>/dev/null || echo "(none)"
+          echo "--- npm config get script-shell"; "$site" npm config get script-shell || true
+          echo "--- npm config list"; "$site" npm config list || true
+          echo "--- npm prefix (the project npm sees)"; "$site" npm prefix || true
+          for log in storybook.log storybook.err.log; do
+            [ -f "$log" ] && { echo "--- $log"; tail -n 40 "$log"; }
+          done
+          true
+
       - name: Upload the install logs
         if: failure()
         uses: actions/upload-artifact@v7
