@@ -264,7 +264,7 @@ jobs:
           echo "$out"
           echo "--- end of storybook.log"; tail -n 30 ../storybook.log
           annotate notice "RESULT both-fixes $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
-          debug=$(grep -a 'canvas-utils debug' ../storybook.log | sort -u | head -20 | cut -c1-400)
+          debug=$({ grep -a 'canvas-utils debug' ../storybook.log || true; } | sort -u | head -20 | cut -c1-400)
           [ -z "$debug" ] || annotate notice "canvas-utils debug $RUNNER_OS" "$debug"
           annotate notice "storybook.log both-fixes $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
