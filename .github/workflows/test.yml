@@ -103,29 +103,20 @@ jobs:
           path: test-results
           if-no-files-found: ignore
 
-  # Storybook of the component project runs out of memory on Windows
-  # (rounds 1-2): vite-tsconfig-paths 6.0.5 is the cause, since removing it
-  # alone lets Storybook serve its index in 21s. Round 3 tests three fixes on
-  # Windows and Linux, and checks more than the index: every story module must
-  # load through Vite with its @/components/... imports resolved.
-  windows-storybook:
-    name: storybook fix ${{ matrix.variant }} ${{ matrix.runner }}
+  # Storybook of the component project runs out of memory on Windows:
+  # vite-tsconfig-paths 6.0.5 is the cause (rounds 1-3), and removing it is
+  # the only change that fixes it; a forward-slash root or lazy discovery do
+  # not. Without it, Linux loads every story module. Round 4 checks the same
+  # change in a real browser on Windows and Linux: every story must render in
+  # Storybook's preview, not its error screen.
+  storybook-browser:
+    name: storybook browser drop-plugin ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         runner: [windows-2025, ubuntu-24.04]
-        variant:
-          # Without the plugin: Storybook resolves @/* from tsconfig itself.
-          - drop-plugin
-          # The plugin, with root as a forward-slash path.
-          - forward-slash-root
-          # The plugin, finding tsconfig files lazily instead of at start.
-          - lazy-discovery
-        include:
-          # The unchanged project on Linux, as the reference.
-          - { runner: ubuntu-24.04, variant: as-is }
     defaults:
       run:
         shell: bash
@@ -139,109 +130,99 @@ jobs:
           git clone -q --depth 1 --branch "$SKILL_REF" "$SKILL_REPO" project
           git -C project log -1 --format='Project at %h %s'
 
-      - name: Install the npm packages
+      - name: Install the npm packages and Chromium
         working-directory: project
-        run: npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
+        run: |
+          npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
+          deps=; [ "$RUNNER_OS" = Linux ] && deps=--with-deps
+          npx playwright install $deps chromium > ../playwright.log 2>&1 || { tail -n 40 ../playwright.log; exit 1; }
 
-      - name: Apply the variant
+      - name: Remove vite-tsconfig-paths from the Storybook config
         working-directory: project
-        env:
-          VARIANT: ${{ matrix.variant }}
         run: |
           py=python3; python3 -c 1 2>/dev/null || py=python
           "$py" - <<'PY'
-          import os
-          variant = os.environ["VARIANT"]
           path = ".storybook/main.ts"
           s = open(path).read()
           plugin = "      tsconfigPaths({\n        root: path.resolve(__dirname, '..'),\n      }),\n"
           assert plugin in s, "the tsconfigPaths call is not in main.ts"
-          if variant == "drop-plugin":
-              s = s.replace(plugin, "")
-          elif variant == "forward-slash-root":
-              s = s.replace("root: path.resolve(__dirname, '..'),", "root: path.resolve(__dirname, '..').replace(/\\\\/g, '/'),")
-          elif variant == "lazy-discovery":
-              s = s.replace("root: path.resolve(__dirname, '..'),", "root: path.resolve(__dirname, '..'),\n        projectDiscovery: 'lazy',")
+          s = s.replace(plugin, "").replace("import tsconfigPaths from 'vite-tsconfig-paths';\n", "")
           open(path, "w").write(s)
           PY
           git diff .storybook/main.ts
 
-      - name: Run Storybook, fetch its index and load every story module
+      - name: Render every story in Chromium
         working-directory: project
-        env:
-          VARIANT: ${{ matrix.variant }}
         run: |
-          py=python3; python3 -c 1 2>/dev/null || py=python
-          node node_modules/storybook/dist/bin/dispatcher.js dev -p 6007 --host 127.0.0.1 --no-open --ci > ../storybook.log 2>&1 &
-          memory() {
-            if [ "$RUNNER_OS" = Windows ]; then
-              powershell.exe -NoProfile -Command '[int]((Get-Process node -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum / 1MB)' | tr -d '\r'
-            else
-              # Node 24 renames its main thread, so match the command line, not the name.
-              ps -eo rss=,args= | awk '$2 ~ /(^|\/)node$/ {s += $1} END {print int(s / 1024)}'
-            fi
-          } 2>/dev/null
-          # Results as annotations: the API serves those to anyone, unlike the log.
           annotate() {
             local text="$3"; text="${text//'%'/'%25'}"; text="${text//$'\r'/}"; text="${text//$'\n'/'%0A'}"
             echo "::$1 title=$2::$text"
           }
-          timeline=""
-          start=$SECONDS; peak=0; code=000
+          node node_modules/storybook/dist/bin/dispatcher.js dev -p 6007 --host 127.0.0.1 --no-open --ci > ../storybook.log 2>&1 &
+          start=$SECONDS; code=000
           while [ $((SECONDS - start)) -lt 300 ]; do
             code=$(curl -s -o ../index.json -w '%{http_code}' --max-time 20 http://127.0.0.1:6007/index.json || true)
             [ "$code" = 200 ] && break
-            m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
-            echo "$((SECONDS - start))s: node uses ${m:-0} MB, index.json answers $code"
-            timeline="$timeline$((SECONDS - start))s ${m:-0}MB $code; "
-            grep -q 'heap out of memory' ../storybook.log && { echo "Storybook ran out of memory."; break; }
-            sleep 10
+            grep -q 'heap out of memory' ../storybook.log && break
+            sleep 5
           done
-          index_time=$((SECONDS - start))
-          modules="-"
+          echo "index.json $code after $((SECONDS - start))s"
+          # In the project, so require('playwright') finds the project's copy.
+          cat > render.cjs <<'JS'
+          // Opens each story's preview page and waits for Storybook to mark the
+          // body: sb-show-main (rendered), sb-show-errordisplay (error screen).
+          const fs = require('node:fs');
+          const { chromium } = require('playwright');
+          const base = 'http://127.0.0.1:6007';
+          (async () => {
+            const index = JSON.parse(fs.readFileSync('../index.json', 'utf8'));
+            const stories = Object.values(index.entries).filter((e) => e.type === 'story');
+            const browser = await chromium.launch();
+            const page = await browser.newPage();
+            const errors = [];
+            page.on('pageerror', (e) => errors.push(String(e.message || e)));
+            const render = async (story) => {
+              errors.length = 0;
+              await page.goto(`${base}/iframe.html?id=${story.id}&viewMode=story`, { waitUntil: 'domcontentloaded' });
+              await page.waitForFunction(
+                () => /sb-show-(main|errordisplay|nopreview)/.test(document.body.className),
+                null, { timeout: 60000 });
+              const state = await page.evaluate(() => document.body.className.match(/sb-show-(\w+)/)[1]);
+              const message = state === 'main' ? '' : await page.evaluate(() =>
+                [document.querySelector('#error-message'), document.querySelector('#error-stack')]
+                  .map((n) => (n ? n.textContent.trim() : '')).join(' | ').slice(0, 400));
+              return { state, message };
+            };
+            let rendered = 0;
+            const failed = [];
+            for (const story of stories) {
+              let result;
+              // The first visits can meet Vite's dependency optimisation reload.
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                try { result = await render(story); } catch (e) { result = { state: 'timeout', message: String(e.message).split('\n')[0] }; }
+                if (result.state === 'main') break;
+              }
+              if (result.state === 'main') rendered++;
+              else failed.push(`${story.id} (${story.importPath}): ${result.state} ${result.message} ${errors.slice(0, 2).join(' / ')}`.slice(0, 600));
+            }
+            console.log(`${rendered}/${stories.length} stories rendered`);
+            for (const line of failed.slice(0, 20)) console.log(`  FAILED ${line}`);
+            await browser.close();
+            process.exit(failed.length ? 1 : 0);
+          })().catch((e) => { console.log(`render script failed: ${e.message}`); process.exit(2); });
+          JS
+          status=0; out="index.json $code"
           if [ "$code" = 200 ]; then
-            # Each story file through Vite's transform, as the preview loads it:
-            # an unresolved @/components/... import fails the transform (500)
-            # or stays in the output.
-            modules=$("$py" - <<'PY'
-          import json, re, urllib.request, urllib.error
-          # An import of the alias that Vite left as it was; the inline source
-          # map is cut first, since it quotes the original source.
-          unresolved = re.compile(r"""(from\s*|import\s*\(\s*|import\s+)["']@/components/""")
-          entries = json.load(open("../index.json"))["entries"].values()
-          paths = sorted({e["importPath"] for e in entries})
-          ok, bad = 0, []
-          for p in paths:
-              url = "http://127.0.0.1:6007/" + p.lstrip("./")
-              try:
-                  body = urllib.request.urlopen(url, timeout=60).read().decode("utf-8", "replace")
-                  code = body.split("//# sourceMappingURL=")[0]
-                  if unresolved.search(code):
-                      bad.append(f"{p}: @/components/ left unresolved")
-                  else:
-                      ok += 1
-              except urllib.error.HTTPError as e:
-                  bad.append(f"{p}: HTTP {e.code} {e.read().decode('utf-8', 'replace')[:300]}")
-              except Exception as e:
-                  bad.append(f"{p}: {e}")
-          print(f"{ok}/{len(paths)} loaded")
-          for line in bad[:15]:
-              print("  FAILED " + line)
-          PY
-            )
+            out=$(node render.cjs 2>&1) || status=$?
+          else
+            status=1
           fi
-          m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
-          entries=$("$py" -c "import json; print(len(json.load(open('../index.json'))['entries']))" 2>/dev/null || echo "-")
-          result="RESULT $VARIANT on $RUNNER_OS: index.json $code after ${index_time}s, $entries entries, story modules ${modules%%$'\n'*}, peak node memory ${peak} MB"
-          echo "$result"
-          [ "$modules" = "-" ] || printf '%s\n' "$modules"
+          echo "$out"
           echo "--- end of storybook.log"; tail -n 30 ../storybook.log
-          annotate notice "RESULT $VARIANT $RUNNER_OS" "$result"
-          annotate notice "memory $VARIANT $RUNNER_OS" "$timeline"
-          [ "$modules" = "-" ] || annotate notice "story modules $VARIANT $RUNNER_OS" "$modules"
-          annotate notice "storybook.log $VARIANT $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
+          annotate notice "RESULT drop-plugin $RUNNER_OS" "$(printf 'index.json %s after %ss\n%s' "$code" "$((SECONDS - start))" "$out")"
+          annotate notice "storybook.log drop-plugin $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
-          [ "$code" = 200 ] && case "$modules" in *FAILED*) false ;; *) true ;; esac
+          exit $status
 
   install:
     name: install ${{ matrix.runner }}
