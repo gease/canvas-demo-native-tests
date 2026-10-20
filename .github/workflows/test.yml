@@ -177,15 +177,23 @@ jobs:
             if [ "$RUNNER_OS" = Windows ]; then
               powershell.exe -NoProfile -Command '[int]((Get-Process node -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum / 1MB)' | tr -d '\r'
             else
-              ps -C node -o rss= | awk '{s += $1} END {print int(s / 1024)}'
+              # Node 24 renames its main thread, so match the command line, not the name.
+              ps -eo rss=,args= | awk '$2 ~ /(^|\/)node$/ {s += $1} END {print int(s / 1024)}'
             fi
+          } 2>/dev/null
+          # Results as annotations: the API serves those to anyone, unlike the log.
+          annotate() {
+            local text="$3"; text="${text//'%'/'%25'}"; text="${text//$'\r'/}"; text="${text//$'\n'/'%0A'}"
+            echo "::$1 title=$2::$text"
           }
+          timeline=""
           start=$SECONDS; peak=0; code=000
           while [ $((SECONDS - start)) -lt 300 ]; do
             code=$(curl -s -o ../index.json -w '%{http_code}' --max-time 20 http://127.0.0.1:6007/index.json || true)
             [ "$code" = 200 ] && break
             m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
             echo "$((SECONDS - start))s: node uses ${m:-0} MB, index.json answers $code"
+            timeline="$timeline$((SECONDS - start))s ${m:-0}MB $code; "
             grep -q 'heap out of memory' ../storybook.log && { echo "Storybook ran out of memory."; break; }
             sleep 10
           done
@@ -224,9 +232,14 @@ jobs:
           fi
           m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
           entries=$("$py" -c "import json; print(len(json.load(open('../index.json'))['entries']))" 2>/dev/null || echo "-")
-          echo "RESULT $VARIANT on $RUNNER_OS: index.json $code after ${index_time}s, $entries entries, story modules ${modules%%$'\n'*}, peak node memory ${peak} MB"
+          result="RESULT $VARIANT on $RUNNER_OS: index.json $code after ${index_time}s, $entries entries, story modules ${modules%%$'\n'*}, peak node memory ${peak} MB"
+          echo "$result"
           [ "$modules" = "-" ] || printf '%s\n' "$modules"
           echo "--- end of storybook.log"; tail -n 30 ../storybook.log
+          annotate notice "RESULT $VARIANT $RUNNER_OS" "$result"
+          annotate notice "memory $VARIANT $RUNNER_OS" "$timeline"
+          [ "$modules" = "-" ] || annotate notice "story modules $VARIANT $RUNNER_OS" "$modules"
+          annotate notice "storybook.log $VARIANT $RUNNER_OS" "$(tail -n 25 ../storybook.log | cut -c1-300)"
           if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM node.exe > /dev/null 2>&1 || true; else pkill -f dispatcher.js || true; fi
           [ "$code" = 200 ] && case "$modules" in *FAILED*) false ;; *) true ;; esac
 
