@@ -103,6 +103,96 @@ jobs:
           path: test-results
           if-no-files-found: ignore
 
+  # Diagnostic: on Windows, Storybook of the component project ran out of
+  # memory (about 4 GB) while building its story index, where Linux and macOS
+  # take seconds. Each variant runs the project on plain Node (no drupack, no
+  # skill), starts Storybook, asks for index.json and reports the time and the
+  # memory Node used, to tell which part of the setup causes it.
+  windows-storybook:
+    name: windows storybook ${{ matrix.variant }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - as-is
+          - no-experimental-features
+          - no-canvas-utils-plugins
+          - no-mcp-vitest-addons
+          - more-memory
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+
+      - name: Get the component project
+        run: |
+          git clone -q --depth 1 --branch "$SKILL_REF" "$SKILL_REPO" project
+          git -C project log -1 --format='Project at %h %s'
+
+      - name: Install the npm packages
+        working-directory: project
+        run: npm ci --no-audit --no-fund > ../npm-ci.log 2>&1 || { tail -n 40 ../npm-ci.log; exit 1; }
+
+      - name: Apply the variant
+        working-directory: project
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python - <<'PY'
+          import os, re
+          variant = os.environ["VARIANT"]
+          path = ".storybook/main.ts"
+          s = open(path).read()
+          def sub(old, new):
+              global s
+              assert old in s, f"{old!r} is not in {path}"
+              s = s.replace(old, new)
+          if variant == "no-experimental-features":
+              sub("experimentalComponentsManifest: true", "experimentalComponentsManifest: false")
+              sub("experimentalCodeExamples: true", "experimentalCodeExamples: false")
+          elif variant == "no-canvas-utils-plugins":
+              sub("componentNameResolver(),", "")
+              sub("plugins: [componentCssPlugin()]", "plugins: []")
+          elif variant == "no-mcp-vitest-addons":
+              s, n = re.subn(r"addons: \[.*?\n  \],", "addons: ['@storybook/addon-docs'],", s, flags=re.S)
+              assert n == 1, "no addons array found"
+          open(path, "w").write(s)
+          PY
+          if [ "$VARIANT" = more-memory ]; then echo "NODE_OPTIONS=--max-old-space-size=12288" >> "$GITHUB_ENV"; fi
+          git diff --stat; git diff .storybook/main.ts | head -40
+
+      - name: Start Storybook and fetch its index
+        working-directory: project
+        run: |
+          npx storybook dev -p 6007 --host 127.0.0.1 --no-open --ci > ../storybook.log 2>&1 &
+          memory() { powershell.exe -NoProfile -Command '[int]((Get-Process node -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum / 1MB)' | tr -d '\r'; }
+          start=$SECONDS; peak=0; ready=; code=000
+          while [ $((SECONDS - start)) -lt 900 ]; do
+            if [ -z "$ready" ] && grep -q 'Storybook ready' ../storybook.log 2>/dev/null; then
+              ready=$((SECONDS - start)); echo "Storybook ready after ${ready}s"
+            fi
+            # Ask anyway after two minutes, in case the ready banner looks different.
+            if [ -n "$ready" ] || [ $((SECONDS - start)) -gt 120 ]; then
+              code=$(curl -s -o ../index.json -w '%{http_code}' --max-time 20 http://127.0.0.1:6007/index.json || true)
+              [ "$code" = 200 ] && break
+            fi
+            m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
+            echo "$((SECONDS - start))s: node uses ${m:-0} MB, index.json answers $code"
+            grep -q 'heap out of memory' ../storybook.log && { echo "Storybook ran out of memory."; break; }
+            sleep 10
+          done
+          m=$(memory); [ "${m:-0}" -gt "$peak" ] && peak=$m
+          entries=$(python -c "import json; print(len(json.load(open('../index.json'))['entries']))" 2>/dev/null || echo "-")
+          echo "RESULT ${{ matrix.variant }}: index.json $code after $((SECONDS - start))s, $entries entries, peak node memory ${peak} MB"
+          echo "--- end of storybook.log"; tail -n 40 ../storybook.log
+          taskkill //F //IM node.exe > /dev/null 2>&1 || true
+          [ "$code" = 200 ]
+
   install:
     name: install ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
