@@ -139,6 +139,12 @@ jobs:
           deps=; [ "$RUNNER_OS" = Linux ] && deps=--with-deps
           npx playwright install $deps chromium > ../playwright.log 2>&1 || { tail -n 40 ../playwright.log; exit 1; }
 
+      - name: Build the components with the Canvas CLI
+        working-directory: project
+        run: |
+          npx canvas build > ../build.log 2>&1 || { tail -n 40 ../build.log; exit 1; }
+          tail -n 5 ../build.log
+
       - name: Render every story in Chromium
         working-directory: project
         run: |
@@ -374,6 +380,36 @@ jobs:
           if bash ../.drupal-demo/bin/storybook.sh status; then echo "Storybook still runs after stop." >&2; exit 1; fi
           bash ../.drupal-demo/bin/storybook.sh start
           bash ../.drupal-demo/bin/storybook.sh status
+
+      # The Canvas CLI end to end, into this run's own throwaway site: the
+      # build (which needs the @drupal-canvas/cli patch on Windows) and the
+      # upload (which needs the client's media upload scopes). Then the
+      # components are read back from the site.
+      - name: Push the components to the installed site
+        working-directory: ${{ runner.temp }}/demo/storybook
+        run: |
+          site=../canvas-demo; [ "$RUNNER_OS" = Windows ] && site=../canvas-demo.exe
+          "$site" npx canvas push --no-pages --no-regions --no-content-templates -y > ../push.log 2>&1 \
+            || { tail -n 40 ../push.log; exit 1; }
+          tail -n 5 ../push.log
+          py=python3; python3 -c 1 2>/dev/null || py=python
+          # Every component of the project (one <name>.component.yml each) must
+          # now be on the site, which already has the demo content's own.
+          (set -a; . ./.env; set +a
+            token=$(curl -s -X POST "$CANVAS_SITE_URL/oauth/token" -d grant_type=client_credentials \
+              --data-urlencode "client_id=$CANVAS_CLIENT_ID" --data-urlencode "client_secret=$CANVAS_CLIENT_SECRET" \
+              --data-urlencode scope=canvas:js_component | "$py" -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+            curl -s -H "Authorization: Bearer $token" "$CANVAS_SITE_URL/canvas/api/v0/config/js_component" > ../remote.json)
+          "$py" - <<'PY'
+          import glob, json, os, sys
+          remote = set(json.load(open("../remote.json")))
+          local = sorted({os.path.basename(p)[: -len(".component.yml")] for p in glob.glob("src/components/*/*.component.yml")})
+          missing = [n for n in local if n not in remote]
+          print(f"{len(local)} project components, {len(local) - len(missing)} on the site")
+          if missing:
+              print("missing on the site: " + ", ".join(missing))
+              sys.exit(1)
+          PY
 
       - name: Run the hand-over report
         run: bash "$SKILL/scripts/report.sh" --dir "$DEMO" | sed 's#/user/reset/[^ ]*#/user/reset/(one-time link)#'
