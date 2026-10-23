@@ -31,10 +31,10 @@ permissions:
   contents: read
 
 env:
-  BUILD_URL: ${{ inputs.build_url || 'https://gitlab.com/freelygive/canvas-storybook-ai/-/jobs/17297188984/artifacts/raw/.drupack/dist' }}
+  BUILD_URL: ${{ inputs.build_url || 'https://gitlab.com/freelygive/canvas-storybook-ai/-/jobs/17410532287/artifacts/raw/.drupack/dist' }}
   SKILL_REPO: https://gitlab.com/freelygive/canvas-storybook-ai.git
   SKILL_REF: ${{ inputs.skill_ref || 'feat/drupal-demo-install' }}
-  DRUPACK_REF: ${{ inputs.drupack_ref || '1.0.0-beta1' }}
+  DRUPACK_REF: ${{ inputs.drupack_ref || '1.0.0-beta10' }}
 
 jobs:
   conformance:
